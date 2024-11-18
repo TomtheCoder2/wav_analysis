@@ -1,13 +1,12 @@
 use eframe::egui;
-use egui::debug_text::print;
 use egui_plot::PlotPoint;
 use egui_plot::{Legend, Line, Plot, PlotPoints};
 use hound;
 use rustfft::{num_complex::Complex, FftPlanner};
 use std::fs::File;
-use std::path::Path;
 use std::io::Write;
 use std::ops::AddAssign;
+use std::path::Path;
 
 fn read_wav(file_path: &str) -> Result<(Vec<f32>, u32), String> {
     let reader = hound::WavReader::open(file_path).map_err(|e| e.to_string())?;
@@ -33,7 +32,7 @@ fn fourier_analysis(samples: &[f32], sample_rate: u32) -> (Vec<f32>, Vec<f32>) {
     fft.process(&mut buffer);
 
     let freqs: Vec<f32> = (0..buffer.len() / 2)
-        .map(|i| i as f32* sample_rate as f32 / samples.len() as f32)
+        .map(|i| i as f32 * sample_rate as f32 / samples.len() as f32)
         .collect();
     let amplitudes: Vec<f32> = buffer.iter().take(buffer.len() / 2).map(|c| c.norm()).collect();
     (freqs, amplitudes)
@@ -76,19 +75,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("Starting eframe with {} plots", plots.len());
-    eframe::run_native(
+    match eframe::run_native(
         "Frequency Spectrum",
         eframe::NativeOptions::default(),
-        Box::new(|_| Ok(Box::new(MyApp {
-            plots,
-            avg_plot: PlotData {
-                freqs: vec![],
-                amplitudes: vec![],
-                file_name: "".to_string(),
-            },
-        }))),
-    );
-    Ok(())
+        Box::new(|cc| Ok(Box::new(MyApp::new(cc, plots)))),
+    ) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -98,9 +92,54 @@ struct PlotData {
     file_name: String,
 }
 
+impl Default for PlotData {
+    fn default() -> Self {
+        Self {
+            freqs: vec![],
+            amplitudes: vec![],
+            file_name: "".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct MyApp {
+    #[serde(skip)]
     plots: Vec<PlotData>,
+    #[serde(skip)]
     avg_plot: PlotData,
+    min_freq: f32,
+    max_freq: f32,
+}
+
+impl Default for MyApp {
+    fn default() -> Self {
+        Self {
+            plots: Vec::new(),
+            avg_plot: PlotData::default(),
+            min_freq: 0.0,
+            max_freq: 20_000.0,
+        }
+    }
+}
+
+impl MyApp {
+    /// Called once before the first frame.
+    pub fn new(cc: &eframe::CreationContext<'_>, plots: Vec<PlotData>) -> Self {
+        // This is also where you can customize the look and feel of egui using
+        // `cc.egui_ctx.set_visuals` and `cc.egui_ctx.set_fonts`.
+
+        // Load previous app state (if any).
+        // Note that you must enable the `persistence` feature for this to work.
+        let mut app:Self = if let Some(storage) = cc.storage {
+            eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default()
+        } else {
+            Self::default()
+        };
+
+        app.plots = plots;
+        app
+    }
 }
 
 impl eframe::App for MyApp {
@@ -112,48 +151,63 @@ impl eframe::App for MyApp {
                 let mut file = File::create(path).unwrap();
                 file.write_all(&encoded).unwrap();
             }
+            ui.horizontal(|ui| {
+                ui.label("Min freq:");
+                ui.add(egui::Slider::new(&mut self.min_freq, 0.0..=100_000.0).text("Min freq"));
+                ui.label("Max freq:");
+                ui.add(egui::Slider::new(&mut self.max_freq, 0.0..=100_000.0).text("Max freq"));
+            });
 
             Plot::new("my_plot")
                 .legend(Legend::default())
-                .view_aspect(2.0)
+                // .view_aspect(2.0)
                 .show(ui, |plot_ui| {
                     for plot_data in &self.plots {
                         let points: Vec<_> = plot_data
                             .freqs
                             .iter()
                             .zip(plot_data.amplitudes.iter())
-                            .filter(|(&freq, _)| freq <= 500000.0)
+                            .filter(|(&freq, _)| freq >= self.min_freq && freq <= self.max_freq)
                             .map(|(&freq, &amp)| PlotPoint::new(freq, amp))
                             .collect();
                         plot_ui.line(Line::new(PlotPoints::Owned(points)).name(&plot_data.file_name));
                     }
-                    // create average plot
-                    let mut avg_amplitudes = vec![0.0; self.plots[0].amplitudes.len()];
-                    for plot_data in &self.plots {
-                        for (i, &amp) in plot_data.amplitudes.iter().enumerate() {
-                            // add the amp or if it doesn't exist, insert it
-                            if let Some(avg_amp) = avg_amplitudes.get_mut(i) {
-                                avg_amp.add_assign(amp);
-                            } else {
-                                avg_amplitudes.push(amp);}
+                    if self.plots.len() > 0 {
+                        // create average plot
+                        let mut avg_amplitudes = vec![0.0; self.plots[0].amplitudes.len()];
+                        for plot_data in &self.plots {
+                            for (i, &amp) in plot_data.amplitudes.iter().enumerate() {
+                                // add the amp or if it doesn't exist, insert it
+                                if let Some(avg_amp) = avg_amplitudes.get_mut(i) {
+                                    avg_amp.add_assign(amp);
+                                } else {
+                                    avg_amplitudes.push(amp);
+                                }
+                            }
                         }
+                        avg_amplitudes.iter_mut().for_each(|amp| *amp /= self.plots.len() as f32);
+                        let points: Vec<_> = self
+                            .plots[0]
+                            .freqs
+                            .iter()
+                            .zip(avg_amplitudes.iter())
+                            .filter(|(&freq, _)| freq >= self.min_freq && freq <= self.max_freq)
+                            .map(|(&freq, &amp)| PlotPoint::new(freq, amp))
+                            .collect();
+                        plot_ui.line(Line::new(PlotPoints::Owned(points)).name("Average"));
+                        self.avg_plot = PlotData {
+                            freqs: self.plots[0].freqs.clone(),
+                            amplitudes: avg_amplitudes,
+                            file_name: "average".to_string(),
+                        };
                     }
-                    avg_amplitudes.iter_mut().for_each(|amp| *amp /= self.plots.len() as f32);
-                    let points: Vec<_> = self
-                        .plots[0]
-                        .freqs
-                        .iter()
-                        .zip(avg_amplitudes.iter())
-                        .filter(|(&freq, _)| freq <= 500000.0)
-                        .map(|(&freq, &amp)| PlotPoint::new(freq, amp))
-                        .collect();
-                    plot_ui.line(Line::new(PlotPoints::Owned(points)).name("Average"));
-                    self.avg_plot = PlotData {
-                        freqs: self.plots[0].freqs.clone(),
-                        amplitudes: avg_amplitudes,
-                        file_name: "average".to_string(),
-                    };
                 });
         });
+    }
+
+    /// Called by the framework to save state before shutdown.
+    /// On Windows its saved here: C:\Users\UserName\AppData\Roaming\Phoenix\data\app.ron
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, eframe::APP_KEY, self);
     }
 }
